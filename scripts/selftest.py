@@ -127,6 +127,7 @@ def run_drill(base: str, **overrides) -> dict:
 
 
 def summarize(name: str, state: dict) -> dict:
+    bf = state["slow"]["backfill"]
     return {
         "scenario": name,
         "outcome": state["outcome"],
@@ -135,9 +136,13 @@ def summarize(name: str, state: dict) -> dict:
         "slow": state["slow"]["received_bytes"],
         "slow_sha": state["slow"]["verification"]["result"],
         "missing": state["slow"]["missing_bytes"],
-        "backfill": state["slow"]["backfill"]["status"],
-        "etag_ok": state["slow"]["backfill"]["etag_verified"],
-        "range_ok": state["slow"]["backfill"]["range_verified"],
+        "backfill": bf["status"],
+        "etag_ok": bf["etag_verified"],
+        "range_ok": bf["range_verified"],
+        "bf_cap": bf.get("capped_at_bytes"),
+        "bf_origin_sent": bf.get("origin_sent_bytes"),
+        "bf_slow_received": bf.get("received_bytes"),
+        "bf_settlement": bf.get("settlement"),
         "retention_peak": state["retention"]["peak_bytes"],
         "retention_mem_peak": state["retention"]["peak_memory_bytes"],
         "retention_disk_peak": state["retention"]["peak_disk_bytes"],
@@ -202,15 +207,24 @@ def main() -> int:
             auto_switch_on_pause=True,
         )
         results.append(summarize("auto swap, tail not retained", state))
+        bf3 = state["slow"]["backfill"]
         ok = (
             state["origin_switch"]["triggered"]
             and state["origin"]["current_version"] == "v2"
-            and state["slow"]["backfill"]["status"] == "rejected"
-            and state["slow"]["backfill"]["etag_verified"] is False
+            and bf3["status"] == "rejected"
+            and bf3["etag_verified"] is False
             and state["outcome"] == "slow_missing"
             and state["fast"]["received_bytes"] == total
             and state["fast"]["verification"]["result"] == "match"
             and state["origin"]["main_requests"] == 1
+            # The rejected full-layer body must never exceed the round cap and
+            # is charged against the quota; the slow route keeps none of it.
+            and bf3["settlement"] == "settled"
+            and bf3["origin_sent_bytes"] is not None
+            and 0 < bf3["origin_sent_bytes"] <= bf3["capped_at_bytes"]
+            and bf3["used_bytes"] == bf3["origin_sent_bytes"]
+            and bf3["received_bytes"] == 0
+            and bf3["version_check"]["requests"] == 1
         )
         if not ok:
             failures.append("scenario 3 (auto swap, tail not retained)")
@@ -257,13 +271,18 @@ def main() -> int:
 
     print(json.dumps(results, indent=2, ensure_ascii=False))
     print()
-    print(f"{'scenario':32} {'outcome':14} {'fast':>9} {'slow':>9} {'missing':>9} "
-          f"{'backfill':>11} {'ret peak':>10} {'origin sent':>12}")
+    print(
+        f"{'scenario':32} {'outcome':14} {'fast':>9} {'slow':>9} {'missing':>9} "
+        f"{'backfill':>11} {'bf cap':>10} {'bf sent':>10} {'bf kept':>10} "
+        f"{'settle':>9}"
+    )
     for r in results:
         print(
             f"{r['scenario']:32} {r['outcome']:14} {r['fast']:>9} {r['slow']:>9} "
-            f"{r['missing']:>9} {r['backfill']:>11} {r['retention_peak']:>10} "
-            f"{r['origin_sent']:>12}"
+            f"{r['missing']:>9} {r['backfill']:>11} "
+            f"{(r['bf_cap'] if r['bf_cap'] is not None else 0):>10} "
+            f"{(r['bf_origin_sent'] if r['bf_origin_sent'] is not None else 0):>10} "
+            f"{r['bf_slow_received']:>10} {str(r['bf_settlement']):>9}"
         )
     print()
     if failures:

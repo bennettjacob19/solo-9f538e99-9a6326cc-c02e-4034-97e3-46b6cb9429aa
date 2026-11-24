@@ -40,6 +40,13 @@ PHASE_RESUME = "slow_resuming"
 PHASE_BACKFILL = "backfill"
 PHASE_DONE = "complete"
 
+# Settlement tuning: poll the origin's final counter quickly while the drill
+# is still in the backfill phase, then hand over to a background task.
+SETTLE_INLINE_ATTEMPTS = 10
+SETTLE_INLINE_INTERVAL_S = 0.1
+SETTLE_BG_ATTEMPTS = 150
+SETTLE_BG_INTERVAL_S = 0.2
+
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int(time.time() * 1000) % 1000:03d}Z"
@@ -170,15 +177,33 @@ class DrillRun:
         self.backfill = {
             "attempted": False,
             "quota_bytes": params.backfill_bytes,
-            "used_bytes": 0,
+            # used_bytes is charged against the *origin actually sent* bytes of
+            # the backfill round (including rejected bodies and bytes sent
+            # before a disconnect), never merely against bytes the slow route
+            # kept.  It stays None until the origin's final counter settles.
+            "used_bytes": None,
             "requested_start": None,
             "requested_end": None,
+            "capped_at_bytes": None,
+            # What the slow route actually kept as backfill body bytes.
             "received_bytes": 0,
+            "origin_sent_bytes": None,
+            "settlement": "not_needed",
+            "origin_request_id": None,
             "status": "not_needed",
             "etag_verified": False,
             "range_verified": False,
             "rejected_reason": None,
+            "version_check": {
+                "attempted": False,
+                "requests": 0,
+                "origin_etag": None,
+                "origin_version": None,
+                "matches_main": None,
+                "error": None,
+            },
         }
+        self._settle_tasks: set[asyncio.Task] = set()
         self.origin_switch: dict[str, Any] = {"triggered": False, "source": None}
 
     # ------------------------------------------------------------------ utils
@@ -212,11 +237,21 @@ class DrillRun:
         if self._task and not self._task.done():
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
+        for task in list(self._settle_tasks):
+            task.cancel()
+        if self._settle_tasks:
+            await asyncio.gather(*self._settle_tasks, return_exceptions=True)
         self.retention.close()
 
     async def _origin_post(self, path: str, params: dict[str, Any] | None = None) -> dict:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
             resp = await client.post(self.origin_base + path, params=params)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def _origin_get_json(self, path: str) -> dict:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.get(self.origin_base + path)
             resp.raise_for_status()
             return resp.json()
 
@@ -392,30 +427,168 @@ class DrillRun:
         self.phase = PHASE_BACKFILL
         await self._backfill(missing)
 
+    async def _check_origin_version_once(self) -> None:
+        """At most one version lookup per backfill round, done before fetching."""
+        check = self.backfill["version_check"]
+        if check["attempted"]:
+            return
+        check["attempted"] = True
+        try:
+            data = await self._origin_get_json("/origin/state")
+            check["requests"] += 1
+            state = data.get("state", {})
+            check["origin_etag"] = state.get("current_etag")
+            check["origin_version"] = state.get("current_version")
+            check["matches_main"] = (
+                check["origin_etag"] is not None
+                and check["origin_etag"] == self.main_etag
+            )
+            self.log(
+                "backfill",
+                f"取段前唯一一次版本查询：源站当前 {check['origin_version']}，"
+                f"ETag {check['origin_etag']}，"
+                f"与主下载{'一致' if check['matches_main'] else '不一致（已换版）'}",
+            )
+        except Exception as exc:  # pragma: no cover - network defensive
+            check["error"] = f"{type(exc).__name__}: {exc}"
+            self.log("backfill", f"取段前版本查询失败，改由 If-Range 兜底：{exc}")
+
+    async def _settle_origin_sent(
+        self, request_id: Optional[str], provisional: int
+    ) -> None:
+        """Resolve the origin's own final byte counter for the backfill request.
+
+        New origins expose ``X-Request-Id`` and keep every request in
+        ``/origin/state``; unupgraded origins without that header are matched by
+        the most recent ``range`` record instead.  While the origin is still
+        streaming, the record stays ``in_flight``: we then mark the round as
+        "settling" and keep polling in a background task so the web page can
+        show 待结算 and update once the final count lands.
+        """
+        info = self.backfill
+        info["origin_request_id"] = request_id
+        info["origin_sent_bytes"] = None
+        info["settlement"] = "settling"
+        info["used_bytes"] = None
+
+        async def poll_once() -> Optional[int]:
+            data = await self._origin_get_json("/origin/state")
+            requests = data.get("state", {}).get("requests", [])
+            if not requests:
+                return None
+            if request_id is not None:
+                # New origin: exact correlation.  Do not fall back to another
+                # record if the trimmed history no longer contains this id --
+                # that would charge the wrong request.
+                for rec in requests:
+                    if str(rec.get("id")) == str(request_id):
+                        target = rec
+                        break
+                else:
+                    return None
+            else:
+                # Unupgraded origin: no X-Request-Id header, take the newest
+                # range request the origin knows about.
+                target = next(
+                    (r for r in requests if r.get("kind") == "range"), None
+                )
+                if target is None:
+                    return None
+            if target.get("outcome") == "in_flight":
+                return None
+            value = target.get("bytes_sent")
+            return int(value) if value is not None else None
+
+        for _ in range(SETTLE_INLINE_ATTEMPTS):
+            try:
+                final_bytes = await poll_once()
+            except Exception:
+                final_bytes = None
+            if final_bytes is not None:
+                info["origin_sent_bytes"] = final_bytes
+                info["used_bytes"] = final_bytes
+                info["settlement"] = "settled"
+                self.log(
+                    "backfill",
+                    f"源站最终计数已结算：本轮实发 {final_bytes} 字节，"
+                    f"回源额度余量 {max(0, self.params.backfill_bytes - final_bytes)} 字节",
+                )
+                return
+            await asyncio.sleep(SETTLE_INLINE_INTERVAL_S)
+
+        # Still in flight (or the state endpoint is flaky): keep the round in
+        # 待结算 and settle later from a background task without blocking the
+        # drill's completion.
+        async def keep_settling() -> None:
+            try:
+                for _ in range(SETTLE_BG_ATTEMPTS):
+                    await asyncio.sleep(SETTLE_BG_INTERVAL_S)
+                    try:
+                        final_bytes = await poll_once()
+                    except Exception:
+                        continue
+                    if final_bytes is not None:
+                        info["origin_sent_bytes"] = final_bytes
+                        info["used_bytes"] = final_bytes
+                        info["settlement"] = "settled"
+                        self.log(
+                            "backfill",
+                            f"源站最终计数补结算：本轮实发 {final_bytes} 字节",
+                        )
+                        return
+                # Give up: the gateway's own read count is the only honest
+                # number left, and the page marks it as provisional.
+                info["origin_sent_bytes"] = provisional
+                info["used_bytes"] = provisional
+                info["settlement"] = "unavailable"
+                info["rejected_reason"] = (
+                    (info["rejected_reason"] + "；" if info["rejected_reason"] else "")
+                    + "源站最终计数暂时查不到，按网关本地计数估算"
+                )
+            except asyncio.CancelledError:  # pragma: no cover
+                raise
+
+        task = asyncio.create_task(keep_settling(), name=f"settle-{self.run_id}")
+        self._settle_tasks.add(task)
+        task.add_done_callback(self._settle_tasks.discard)
+
     async def _backfill(self, missing: int) -> None:
         info = self.backfill
         info["attempted"] = True
-        quota_left = self.params.backfill_bytes - info["used_bytes"]
-        affordable = min(missing, max(0, quota_left))
-        if affordable <= 0:
+        quota_left = self.params.backfill_bytes - (info["used_bytes"] or 0)
+        if quota_left <= 0:
             info["status"] = "quota_exhausted"
+            info["settlement"] = "not_needed"
             info["rejected_reason"] = "backfill quota is zero"
             self.log(
                 "backfill",
-                f"补段额度不足：还缺 {missing} 字节，额度余量 {max(0, quota_left)} 字节",
+                f"补段额度不足：还缺 {missing} 字节，额度余量 0 字节",
             )
             return
+
+        # Rule: at most one version check, and only before the (single) fetch.
+        await self._check_origin_version_once()
+
+        # Hard cap for this round on the body the origin is allowed to send.
+        # It never exceeds the remaining backfill quota, whatever the origin
+        # answers (206 tail or a rejected full-layer 200).
+        cap = min(missing, max(0, quota_left))
         start = self.slow.received_bytes
-        end = start + affordable - 1
+        end = start + cap - 1
+        info["capped_at_bytes"] = cap
         info["requested_start"] = start
         info["requested_end"] = end
         headers = {
             "Range": f"bytes={start}-{end}",
             "If-Range": self.main_etag or "",
+            # Upgraded origins honor this hard byte budget; unupgraded ones
+            # ignore the unknown header and the gateway still caps its reads.
+            "X-Backfill-Cap": str(cap),
         }
         self.log(
             "backfill",
-            f"向源站补段 bytes={start}-{end}，If-Range={self.main_etag}",
+            f"每轮最多取段一次：bytes={start}-{end}（本轮实发上限 {cap} 字节），"
+            f"If-Range={self.main_etag}",
         )
         timeout = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -423,6 +596,7 @@ class DrillRun:
                 "GET", self.origin_base + "/origin/layer", headers=headers
             ) as resp:
                 resp_etag = resp.headers.get("etag")
+                request_id = resp.headers.get("x-request-id")
                 info["response_status"] = resp.status_code
                 info["response_etag"] = resp_etag
                 info["etag_verified"] = bool(
@@ -454,42 +628,57 @@ class DrillRun:
                     reason = f"补段字节区间不符：{content_range!r}"
                 elif not sha_verified:
                     reason = "补段内容摘要与主下载版本不符"
+                accepted = reason is None
                 if reason:
                     info["status"] = "rejected"
                     info["rejected_reason"] = reason
                     self.log("backfill", reason)
-                    return
+                else:
+                    info["status"] = "accepted"
 
-                received = 0
+                # In both cases keep reading, but never past the hard cap:
+                # accepted bytes feed the slow route; rejected bytes are
+                # drained and thrown away yet still count as origin-sent.
+                read_bytes = 0
+                kept_bytes = 0
                 try:
                     async for chunk in resp.aiter_bytes(self.params.chunk_size):
                         if not chunk:
                             continue
-                        room = affordable - received
+                        room = cap - read_bytes
                         if room <= 0:
                             break
                         take = chunk[:room]
-                        self.slow.feed(take)
-                        received += len(take)
-                        info["received_bytes"] = received
-                        info["used_bytes"] += len(take)
+                        read_bytes += len(take)
+                        if accepted:
+                            self.slow.feed(take)
+                            kept_bytes += len(take)
                         if self.params.chunk_delay_ms:
                             await asyncio.sleep(self.params.chunk_delay_ms / 1000.0)
                         else:
                             await asyncio.sleep(0)
                 finally:
-                    if received >= affordable:
-                        info["status"] = "accepted"
-                        self.log(
-                            "backfill",
-                            f"补段校验通过，慢端收到 {received} 字节",
-                        )
-                    else:
+                    info["received_bytes"] = kept_bytes
+                    if accepted and kept_bytes < cap:
                         info["status"] = "short"
                         info["rejected_reason"] = (
-                            f"补段正文只收到 {received}/{affordable} 字节"
+                            f"补段正文只收到 {kept_bytes}/{cap} 字节"
                         )
                         self.log("backfill", info["rejected_reason"])
+                    elif accepted:
+                        self.log(
+                            "backfill",
+                            f"补段校验通过，慢端实收 {kept_bytes} 字节；"
+                            "等待源站最终计数结算实发字节",
+                        )
+                    else:
+                        self.log(
+                            "backfill",
+                            f"被拒收的 {read_bytes} 字节正文照常计入源站实发与回源额度",
+                        )
+
+        # The stream is closed now; reconcile against the origin's own counter.
+        await self._settle_origin_sent(request_id, provisional=read_bytes)
 
     # ---------------------------------------------------------------- results
     def missing_segments(self) -> list[dict[str, int]]:
@@ -574,6 +763,7 @@ class DrillRun:
             if self.slow_paused_at is not None
             else None,
             "origin_switch": dict(self.origin_switch),
+            "backfill_settling": self.backfill.get("settlement") == "settling",
             "events": list(self.events),
         }
 

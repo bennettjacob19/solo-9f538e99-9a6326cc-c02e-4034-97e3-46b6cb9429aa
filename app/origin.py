@@ -234,23 +234,62 @@ def _parse_range(header: str, size: int) -> Optional[tuple[int, int]]:
     return start, min(end, size - 1)
 
 
+def _parse_backfill_cap(request: Request) -> Optional[int]:
+    """Optional hard byte budget advertised by an upgraded gateway.
+
+    Legacy clients never send this header, so their responses are unchanged.
+    """
+    raw = request.headers.get("x-backfill-cap")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _stream_body(
     store: OriginStore,
     version: OriginVersion,
     start: int,
     end: int,
     record: _RequestRecord,
+    request: Optional[Request] = None,
+    max_bytes: Optional[int] = None,
 ):
     async def generator():
         try:
             pos = start
-            while pos <= end:
-                chunk = version.data[pos : min(pos + store.chunk_size, end + 1)]
+            budget = end - start + 1
+            if max_bytes is not None:
+                # The gateway's quota cap: even on an If-Range 200 fallback the
+                # origin never produces more body than the round allows.
+                budget = min(budget, max_bytes)
+            limit = start + budget - 1
+            while pos <= limit:
+                # Stop producing as soon as the client went away: without this
+                # the ASGI server may keep draining the generator to completion,
+                # which would make the origin "send" the whole layer even after
+                # the gateway capped and closed a rejected backfill.
+                if request is not None and await request.is_disconnected():
+                    store.finish_request(record, "aborted")
+                    return
+                chunk = version.data[pos : min(pos + store.chunk_size, limit + 1)]
                 pos += len(chunk)
-                store.record_sent(record, len(chunk))
                 yield chunk
+                # Account only after the chunk was actually handed to the
+                # transport.  When the client disconnects mid-response the
+                # in-flight chunk is never recorded, so the final counter
+                # never overstates what the origin really sent (chunk-level
+                # granularity; TCP ACK telemetry is out of scope).
+                store.record_sent(record, len(chunk))
                 await asyncio.sleep(0)
-            store.finish_request(record, "ok")
+            if pos <= end:
+                # Reached the advertised cap before the natural end.
+                store.finish_request(record, "capped")
+            else:
+                store.finish_request(record, "ok")
         except (asyncio.CancelledError, GeneratorExit):
             store.finish_request(record, "aborted")
             raise
@@ -272,6 +311,7 @@ def make_origin_router(store: OriginStore) -> APIRouter:
         if range_header and if_range is not None and if_range != version.etag:
             # RFC 9110: a failed If-Range means "ignore Range", so the full
             # representation of the *current* version is returned as 200.
+            backfill_cap = _parse_backfill_cap(request)
             record = store.begin_request(
                 kind="range",
                 range_header=range_header,
@@ -281,14 +321,27 @@ def make_origin_router(store: OriginStore) -> APIRouter:
             )
             headers = {
                 "ETag": version.etag,
-                "Content-Length": str(version.size),
                 "Accept-Ranges": "bytes",
                 "X-Content-SHA256": version.sha256,
                 "X-Origin-Version": version.name,
                 "X-If-Range-Matched": "false",
+                "X-Request-Id": str(record.id),
             }
+            if backfill_cap is None:
+                # Legacy path: full representation with its declared length.
+                headers["Content-Length"] = str(version.size)
+            else:
+                # An upgraded gateway negotiated a hard byte budget: stream at
+                # most that many body bytes with chunked transfer encoding, so
+                # no Content-Length mismatch is raised.  The response is still
+                # the RFC 9110 full-200 fallback (not a 206), and the gateway
+                # rejects it on the ETag mismatch regardless.
+                headers["X-Backfill-Cap"] = str(backfill_cap)
             return StreamingResponse(
-                _stream_body(store, version, 0, version.size - 1, record),
+                _stream_body(
+                    store, version, 0, version.size - 1, record, request,
+                    max_bytes=backfill_cap,
+                ),
                 status_code=200,
                 headers=headers,
                 media_type="application/octet-stream",
@@ -311,9 +364,11 @@ def make_origin_router(store: OriginStore) -> APIRouter:
                         "Content-Range": f"bytes */{version.size}",
                         "ETag": version.etag,
                         "X-Origin-Version": version.name,
+                        "X-Request-Id": str(record.id),
                     },
                 )
             start, end = parsed
+            backfill_cap = _parse_backfill_cap(request)
             record = store.begin_request(
                 kind="range",
                 range_header=range_header,
@@ -323,15 +378,22 @@ def make_origin_router(store: OriginStore) -> APIRouter:
             )
             headers = {
                 "ETag": version.etag,
-                "Content-Length": str(end - start + 1),
-                "Content-Range": f"bytes {start}-{end}/{version.size}",
                 "Accept-Ranges": "bytes",
                 "X-Content-SHA256": version.sha256,
                 "X-Origin-Version": version.name,
                 "X-If-Range-Matched": "true" if if_range else "not_sent",
+                "X-Request-Id": str(record.id),
             }
+            if backfill_cap is None or backfill_cap >= end - start + 1:
+                headers["Content-Length"] = str(end - start + 1)
+            else:
+                headers["X-Backfill-Cap"] = str(backfill_cap)
+            headers["Content-Range"] = f"bytes {start}-{end}/{version.size}"
             return StreamingResponse(
-                _stream_body(store, version, start, end, record),
+                _stream_body(
+                    store, version, start, end, record, request,
+                    max_bytes=backfill_cap,
+                ),
                 status_code=206,
                 headers=headers,
                 media_type="application/octet-stream",
@@ -350,9 +412,10 @@ def make_origin_router(store: OriginStore) -> APIRouter:
             "Accept-Ranges": "bytes",
             "X-Content-SHA256": version.sha256,
             "X-Origin-Version": version.name,
+            "X-Request-Id": str(record.id),
         }
         return StreamingResponse(
-            _stream_body(store, version, 0, version.size - 1, record),
+            _stream_body(store, version, 0, version.size - 1, record, request),
             status_code=200,
             headers=headers,
             media_type="application/octet-stream",

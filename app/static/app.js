@@ -113,9 +113,64 @@
       ? `ETag ${bf.etag_verified ? "✓" : "✗"} · 区间 ${bf.range_verified ? "✓" : "✗"}`
       : "-";
     $("backfill-status").textContent = bf.status || "-";
-    $("backfill-quota").textContent = bf.quota_bytes !== undefined
-      ? `${fmt(bf.quota_bytes - (bf.used_bytes || 0))} / ${fmt(bf.quota_bytes)}`
+
+    const vc = bf.version_check || {};
+    if (vc.attempted) {
+      if (vc.error) {
+        $("backfill-version-check").textContent = `查询失败（If-Range 兜底）：${vc.error}`;
+      } else {
+        $("backfill-version-check").textContent =
+          `${vc.origin_version || "-"} · ETag ${vc.matches_main ? "一致 ✓" : "已换版 ✗"}（仅查询 ${vc.requests || 0} 次）`;
+      }
+    } else {
+      $("backfill-version-check").textContent = "-";
+    }
+
+    $("backfill-cap").textContent =
+      bf.capped_at_bytes !== null && bf.capped_at_bytes !== undefined
+        ? fmt(bf.capped_at_bytes)
+        : "-";
+
+    // Origin actually sent vs. what the slow route really kept are two
+    // different numbers when a backfill is rejected.  Both show 待结算 while
+    // the origin stream is still running or its final counter is unavailable.
+    const settling = bf.settlement === "settling";
+    const unavailable = bf.settlement === "unavailable";
+    const originSentEl = $("backfill-origin-sent");
+    if (!bf.attempted) {
+      originSentEl.textContent = "-";
+      originSentEl.classList.remove("pending");
+    } else if (settling) {
+      originSentEl.textContent = "待结算…";
+      originSentEl.classList.add("pending");
+    } else if (bf.origin_sent_bytes === null || bf.origin_sent_bytes === undefined) {
+      originSentEl.textContent = "-";
+      originSentEl.classList.remove("pending");
+    } else {
+      originSentEl.textContent =
+        fmt(bf.origin_sent_bytes) + (unavailable ? "（估算）" : "");
+      originSentEl.classList.toggle("pending", unavailable);
+    }
+    $("backfill-received").textContent = bf.attempted
+      ? fmt(bf.received_bytes || 0)
       : "-";
+
+    const quotaEl = $("backfill-quota");
+    if (bf.quota_bytes === undefined) {
+      quotaEl.textContent = "-";
+      quotaEl.classList.remove("pending");
+    } else if (settling) {
+      quotaEl.textContent = `待结算（额度 ${fmt(bf.quota_bytes)}）`;
+      quotaEl.classList.add("pending");
+    } else {
+      const used = bf.used_bytes === null || bf.used_bytes === undefined
+        ? 0
+        : bf.used_bytes;
+      quotaEl.textContent =
+        `${fmt(Math.max(0, bf.quota_bytes - used))} / ${fmt(bf.quota_bytes)}`
+        + (unavailable ? "（按估算实发）" : "");
+      quotaEl.classList.remove("pending");
+    }
     const qc = state.quota_check;
     $("quota-cover").textContent = qc
       ? (qc.combined_covers_tail ? "是（两项额度够补尾段）" : "否（额度不足）")
@@ -154,7 +209,7 @@
       const resp = await fetch("/api/drill");
       const state = await resp.json();
       render(state);
-      if (state.status === "running") {
+      if (state.status === "running" || state.backfill_settling) {
         pollTimer = setTimeout(poll, 300);
       } else {
         pollTimer = null;
